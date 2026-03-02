@@ -7,14 +7,12 @@ set -e
 PAGES=${PAGES:-"https://example.com"}
 INTERVAL=${INTERVAL:-30}
 
-# Convert comma-separated pages to JSON array
+# Convert comma-separated pages to JSON array (POSIX sh, Alpine-compatible)
 PAGES_JSON="["
-IFS=',' read -r -a PAGE_ARRAY <<EOF
-$PAGES
-EOF
-
 first=true
-for page in "${PAGE_ARRAY[@]}"; do
+OLD_IFS="$IFS"
+IFS=','
+for page in $PAGES; do
   page=$(echo "$page" | tr -d '[:space:]')
   if [ -n "$page" ]; then
     if [ "$first" = true ]; then
@@ -25,6 +23,7 @@ for page in "${PAGE_ARRAY[@]}"; do
     fi
   fi
 done
+IFS="$OLD_IFS"
 PAGES_JSON="${PAGES_JSON}]"
 
 # Write config to be loaded by index.html
