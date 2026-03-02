@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  tv-carousel:
+    image: samuelstreets/web-page-carousel:latest
+    ports:
+      - "8080:80"
+    environment:
+      # Comma-separated list of URLs to cycle through
+      PAGES: >-
+        https://example.com,
+        https://wikipedia.org,
+        https://news.ycombinator.com
+
+      # How many seconds to show each page before switching
+      INTERVAL: 30
+
+    restart: unless-stopped
