@@ -1,15 +1,125 @@
-server {
-    listen 80;
-    server_name _;
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TV Carousel</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      font-family: 'Courier New', monospace;
+    }
+    #splash {
+      position: fixed;
+      inset: 0;
+      background: #000;
+      color: #0ff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      gap: 24px;
+    }
+    #splash h1 { font-size: 2rem; letter-spacing: 4px; }
+    #splash p { font-size: 1rem; opacity: 0.6; }
+    #progress-bar {
+      width: 300px;
+      height: 3px;
+      background: rgba(0,255,255,0.2);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%;
+      background: #0ff;
+      width: 0%;
+      transition: width linear;
+    }
+    #url-label { font-size: 0.8rem; opacity: 0.5; }
+  </style>
+</head>
+<body>
+  <div id="splash">
+    <h1>📺 TV CAROUSEL</h1>
+    <div id="url-label">Loading...</div>
+    <div id="progress-bar"><div id="progress-fill"></div></div>
+    <p id="countdown"></p>
+  </div>
 
-    location / {
-        root /usr/share/nginx/html;
-        index index.html;
-        try_files $uri $uri/ /index.html;
+  <script src="/config.js"></script>
+  <script>
+    const CONFIG = window.CAROUSEL_CONFIG || {
+      pages: ["https://example.com"],
+      interval: 30
+    };
+
+    const pages = CONFIG.pages;
+    const intervalSeconds = parseInt(CONFIG.interval) || 30;
+    let current = 0;
+
+    const fill = document.getElementById('progress-fill');
+    const urlLabel = document.getElementById('url-label');
+    const countdown = document.getElementById('countdown');
+
+    function keepAwake() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1; canvas.height = 1;
+      canvas.style.cssText = 'position:fixed;top:0;left:0;opacity:0.001;pointer-events:none;z-index:-1';
+      document.body.appendChild(canvas);
+      const ctx = canvas.getContext('2d');
+      setInterval(() => {
+        ctx.fillStyle = `rgb(${Math.floor(Math.random()*2)},0,0)`;
+        ctx.fillRect(0, 0, 1, 1);
+      }, 30000);
+
+      if ('wakeLock' in navigator) {
+        const lock = () => navigator.wakeLock.request('screen').catch(() => {});
+        lock();
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) lock(); });
+      }
     }
 
-    location /config.js {
-        root /usr/share/nginx/html;
-        add_header Cache-Control "no-cache";
+    function showCountdown(seconds, url) {
+      urlLabel.textContent = url;
+      fill.style.transition = 'none';
+      fill.style.width = '0%';
+      requestAnimationFrame(() => {
+        fill.style.transition = `width ${seconds}s linear`;
+        fill.style.width = '100%';
+      });
+
+      let remaining = seconds;
+      countdown.textContent = `Redirecting in ${remaining}s`;
+      const timer = setInterval(() => {
+        remaining--;
+        countdown.textContent = `Redirecting in ${remaining}s`;
+        if (remaining <= 0) clearInterval(timer);
+      }, 1000);
     }
-}
+
+    function goToPage(index) {
+      current = index % pages.length;
+      const url = pages[current];
+      showCountdown(intervalSeconds, url);
+
+      setTimeout(() => {
+        window.location.href = url;
+      }, intervalSeconds * 1000);
+    }
+
+    // If we've been redirected back (via back button or timeout), figure out next page
+    // Store state in sessionStorage
+    const lastIndex = parseInt(sessionStorage.getItem('carousel_index') || '0');
+    const nextIndex = (lastIndex + 1) % pages.length;
+    sessionStorage.setItem('carousel_index', nextIndex);
+
+    keepAwake();
+    goToPage(nextIndex);
+  </script>
+</body>
+</html>
