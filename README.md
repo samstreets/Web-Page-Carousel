@@ -1,4 +1,4 @@
-# 📺 TV Carousel
+# 📺 Web Page Carousel
 
 A Docker-based webpage carousel for TV displays. Cycles through a list of URLs at a configurable interval and keeps the screen awake.
 
@@ -12,7 +12,7 @@ A Docker-based webpage carousel for TV displays. Cycles through a list of URLs a
 docker compose up -d
 ```
 
-Open **http://localhost:8080** on your TV browser.
+Open **http://localhost:8080** on your browser.
 
 ---
 
