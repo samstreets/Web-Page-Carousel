@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   tv-carousel:
     image: samuelstreets/web-page-carousel:latest
