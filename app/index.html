@@ -6,7 +6,7 @@
   <title>Web Page Carousel</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; width: 100vw; height: 100vh; overflow: hidden; }
+    body { background: #000; width: 100vw; height: 100vh; overflow: hidden; cursor: none; }
     iframe {
       position: absolute;
       inset: 0;
@@ -20,6 +20,10 @@
     iframe.active {
       opacity: 1;
       pointer-events: all;
+    }
+    /* When paused, disable pointer events on iframes so clicks reach the body */
+    body.paused iframe.active {
+      pointer-events: none;
     }
     #overlay {
       position: fixed;
@@ -45,12 +49,57 @@
       height: 3px;
       background: #0ff;
       z-index: 9999;
+      transition: background 0.3s;
+    }
+    body.paused #progress {
+      background: #f80;
+    }
+    /* Pause indicator */
+    #pause-indicator {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.6);
+      z-index: 10000;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.25s, transform 0.25s;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #pause-indicator .bar {
+      width: 18px;
+      height: 56px;
+      background: rgba(255,255,255,0.9);
+      border-radius: 4px;
+    }
+    body.paused #pause-indicator {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    /* Click ripple */
+    .ripple {
+      position: fixed;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.6);
+      pointer-events: none;
+      z-index: 9998;
+      animation: ripple-out 0.5s ease-out forwards;
+    }
+    @keyframes ripple-out {
+      from { width: 0; height: 0; opacity: 1; }
+      to   { width: 120px; height: 120px; opacity: 0; }
     }
   </style>
 </head>
 <body>
   <div id="overlay"></div>
   <div id="progress"></div>
+  <div id="pause-indicator">
+    <div class="bar"></div>
+    <div class="bar"></div>
+  </div>
 
   <script src="/config.js"></script>
   <script>
@@ -70,30 +119,101 @@
 
     let current = 0;
     let startTime = null;
+    let pausedAt = null;      // elapsed ms when paused
     let rafId = null;
+    let intervalId = null;
+    let isPaused = false;
+
+    function showOverlay(text, duration = 3000) {
+      overlay.textContent = text;
+      overlay.style.opacity = '1';
+      clearTimeout(overlay._hideTimer);
+      overlay._hideTimer = setTimeout(() => overlay.style.opacity = '0', duration);
+    }
 
     function showPage(index) {
       frames.forEach((f, i) => f.classList.toggle('active', i === index));
-      const url = pages[index];
-      overlay.textContent = `${index + 1} / ${pages.length} — ${url}`;
-      overlay.style.opacity = '1';
-      setTimeout(() => overlay.style.opacity = '0', 3000);
+      showOverlay(`${index + 1} / ${pages.length} — ${pages[index]}`);
       startTime = performance.now();
+      pausedAt = 0;
       animateProgress();
     }
 
     function animateProgress() {
       if (rafId) cancelAnimationFrame(rafId);
       function tick() {
-        const pct = Math.min((performance.now() - startTime) / intervalMs * 100, 100);
+        if (isPaused) return;
+        const elapsed = (performance.now() - startTime);
+        const pct = Math.min(elapsed / intervalMs * 100, 100);
         progress.style.width = pct + '%';
         if (pct < 100) rafId = requestAnimationFrame(tick);
       }
       rafId = requestAnimationFrame(tick);
     }
 
+    function scheduleNext() {
+      clearInterval(intervalId);
+      const remaining = intervalMs - (pausedAt || 0);
+      intervalId = setTimeout(() => {
+        current = (current + 1) % pages.length;
+        showPage(current);
+        intervalId = setInterval(() => {
+          current = (current + 1) % pages.length;
+          showPage(current);
+        }, intervalMs);
+      }, remaining);
+    }
+
+    function pause() {
+      isPaused = true;
+      pausedAt = performance.now() - startTime;
+      clearTimeout(intervalId);
+      clearInterval(intervalId);
+      if (rafId) cancelAnimationFrame(rafId);
+      document.body.classList.add('paused');
+      showOverlay('⏸ Paused — click to resume', 99999);
+    }
+
+    function resume() {
+      isPaused = false;
+      // Adjust startTime so elapsed = pausedAt
+      startTime = performance.now() - pausedAt;
+      document.body.classList.remove('paused');
+      showOverlay(`${current + 1} / ${pages.length} — ${pages[current]}`);
+      animateProgress();
+      // Schedule the remainder of this page, then normal cadence
+      const remaining = intervalMs - pausedAt;
+      clearTimeout(intervalId);
+      clearInterval(intervalId);
+      intervalId = setTimeout(() => {
+        current = (current + 1) % pages.length;
+        showPage(current);
+        intervalId = setInterval(() => {
+          current = (current + 1) % pages.length;
+          showPage(current);
+        }, intervalMs);
+      }, remaining);
+    }
+
+    function spawnRipple(x, y) {
+      const r = document.createElement('div');
+      r.className = 'ripple';
+      r.style.left = (x - 60) + 'px';
+      r.style.top  = (y - 60) + 'px';
+      document.body.appendChild(r);
+      r.addEventListener('animationend', () => r.remove());
+    }
+
+    document.body.addEventListener('click', (e) => {
+      spawnRipple(e.clientX, e.clientY);
+      if (isPaused) {
+        resume();
+      } else {
+        pause();
+      }
+    });
+
     function keepAwake() {
-      // 1. Try standard Wake Lock API (May fail silently without click, but good to have)
       const requestWakeLock = async () => {
         if ('wakeLock' in navigator) {
           try { await navigator.wakeLock.request('screen'); } catch (e) {}
@@ -102,38 +222,32 @@
       requestWakeLock();
       document.addEventListener('visibilitychange', () => { if (!document.hidden) requestWakeLock(); });
 
-      // 2. The "Fake Video Stream" Trick (Requires zero clicks!)
       const canvas = document.createElement('canvas');
       canvas.width = 1; canvas.height = 1;
       canvas.style.cssText = 'position:fixed;top:0;left:0;opacity:0.001;pointer-events:none;z-index:-1';
       document.body.appendChild(canvas);
       const ctx = canvas.getContext('2d');
-      
-      // Update the canvas every second
       setInterval(() => {
         ctx.fillStyle = `rgb(${Math.floor(Math.random() * 255)},0,0)`;
         ctx.fillRect(0, 0, 1, 1);
       }, 1000);
 
-      // Stream the updating canvas to an invisible, muted video element
       if (typeof canvas.captureStream === 'function') {
         const video = document.createElement('video');
         video.style.cssText = 'position:fixed;top:0;left:0;opacity:0.001;pointer-events:none;z-index:-1';
         video.muted = true;
         video.playsInline = true;
         video.autoplay = true;
-        video.srcObject = canvas.captureStream(1); // 1 frame per second
-        
-        // Muted videos are allowed to autoplay without user interaction
+        video.srcObject = canvas.captureStream(1);
         video.play().catch(() => {});
         document.body.appendChild(video);
       }
     }
 
-    // Start everything immediately
+    // Start
     keepAwake();
     showPage(0);
-    setInterval(() => {
+    intervalId = setInterval(() => {
       current = (current + 1) % pages.length;
       showPage(current);
     }, intervalMs);
