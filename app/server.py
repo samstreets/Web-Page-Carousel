@@ -17,6 +17,9 @@ def session_for(url):
 def rewrite_html(content, base_url):
     text = content.decode('utf-8', errors='replace')
 
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
     def rewrite_url(url, base):
         if not url or url.startswith('data:') or url.startswith('javascript:') or url.startswith('#'):
             return url
@@ -35,63 +38,73 @@ def rewrite_html(content, base_url):
 
     text = re.sub(r'url\(([^)]+)\)', replace_css_url, text)
 
-    parsed = urlparse(base_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
+    base_script = f'''<script>
+(function() {{
+    var BASE = "{base_url}";
+    var ORIGIN = "{origin}";
 
-    base_script = f'''<base href="{origin}/">
-    <script>
-    (function() {{
-        var BASE = "{base_url}";
-        var ORIGIN = "{origin}";
-
-        // Proxy fetch
-        var origFetch = window.fetch;
-        window.fetch = function(url, opts) {{
-            if (typeof url === "string" && !url.startsWith("/proxy")) {{
-                var abs = url.startsWith("http") ? url : new URL(url, BASE).href;
-                url = "/proxy/?url=" + encodeURIComponent(abs);
-            }}
-            return origFetch(url, opts);
-        }};
-
-        // Proxy XHR
-        var origXHR = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function(method, url) {{
-            if (typeof url === "string" && !url.startsWith("/proxy")) {{
-                var abs = url.startsWith("http") ? url : new URL(url, BASE).href;
-                url = "/proxy/?url=" + encodeURIComponent(abs);
-            }}
-            return origXHR.apply(this, arguments);
-        }};
-
-        // Intercept window.location redirects
-        var _assign = window.location.assign.bind(window.location);
-        Object.defineProperty(window, 'location', {{
-            get: function() {{ return window._location_real || location; }},
-            set: function(url) {{
-                var abs = (typeof url === "string" && !url.startsWith("http"))
-                    ? new URL(url, BASE).href : url;
-                _assign("/proxy/?url=" + encodeURIComponent(abs));
-            }}
-        }});
-
-        // Intercept history.pushState / replaceState (SPA routing)
-        var origPush    = history.pushState.bind(history);
-        var origReplace = history.replaceState.bind(history);
-        function proxyState(fn, state, title, url) {{
-            if (url && !url.startsWith("/proxy")) {{
-                var abs = url.startsWith("http") ? url : new URL(url, BASE).href;
-                url = "/proxy/?url=" + encodeURIComponent(abs);
-            }}
-            return fn(state, title, url);
+    function toProxy(url) {{
+        if (!url || url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('/proxy/?url=')) {{
+            return url;
         }}
-        history.pushState    = function(s,t,u) {{ proxyState(origPush,    s, t, u); }};
-        history.replaceState = function(s,t,u) {{ proxyState(origReplace, s, t, u); }};
-    }})();
-    </script>'''
+        var abs;
+        if (url.startsWith('http://') || url.startsWith('https://')) {{
+            abs = url;
+        }} else if (url.startsWith('//')) {{
+            abs = '{parsed.scheme}:' + url;
+        }} else if (url.startsWith('/')) {{
+            abs = ORIGIN + url;
+        }} else {{
+            abs = new URL(url, BASE).href;
+        }}
+        return '/proxy/?url=' + encodeURIComponent(abs);
+    }}
+
+    // Proxy fetch
+    var origFetch = window.fetch;
+    window.fetch = function(url, opts) {{
+        if (typeof url === 'string') url = toProxy(url);
+        return origFetch(url, opts);
+    }};
+
+    // Proxy XHR
+    var origXHR = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {{
+        if (typeof url === 'string') url = toProxy(url);
+        return origXHR.apply(this, arguments);
+    }};
+
+    // Intercept navigation
+    var origAssign  = window.location.assign.bind(window.location);
+    var origReplace = window.location.replace.bind(window.location);
+
+    window.location.assign  = function(url) {{ origAssign(toProxy(url)); }};
+    window.location.replace = function(url) {{ origReplace(toProxy(url)); }};
+
+    // Intercept history SPA routing
+    var origPush     = history.pushState.bind(history);
+    var origRepState = history.replaceState.bind(history);
+    history.pushState    = function(s, t, u) {{ origPush(s, t, u ? toProxy(u) : u); }};
+    history.replaceState = function(s, t, u) {{ origRepState(s, t, u ? toProxy(u) : u); }};
+
+    // Catch <a> clicks that weren't rewritten (dynamically inserted links)
+    document.addEventListener('click', function(e) {{
+        var a = e.target.closest('a');
+        if (!a) return;
+        var href = a.getAttribute('href');
+        if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+        if (!href.startsWith('/proxy/')) {{
+            e.preventDefault();
+            window.location.assign(toProxy(href));
+        }}
+    }}, true);
+}})();
+</script>'''
 
     if '<head>' in text:
         text = text.replace('<head>', '<head>' + base_script, 1)
+    elif '<html>' in text:
+        text = text.replace('<html>', '<html>' + base_script, 1)
     else:
         text = base_script + text
 
@@ -113,27 +126,28 @@ def config():
     return Response(js, mimetype='application/javascript', headers={'Cache-Control': 'no-cache'})
 
 
-@app.route('/proxy/')
+@app.route('/proxy/', methods=['GET'])
 def proxy():
     url = request.args.get('url')
     if not url:
         return 'Missing url', 400
     try:
         sess = session_for(url)
-        r = sess.get(url, timeout=10, allow_redirects=True, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        r = sess.get(url, timeout=15, allow_redirects=True, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': request.headers.get('Accept', '*/*'),
+            'Accept-Language': request.headers.get('Accept-Language', 'en-US,en;q=0.9'),
         })
+
         excluded = {'x-frame-options', 'content-security-policy', 'transfer-encoding',
-                    'content-encoding', 'content-length'}
+                    'content-encoding', 'content-length', 'strict-transport-security'}
         headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded}
 
         content_type = r.headers.get('content-type', '')
         if 'text/html' in content_type:
-            content = rewrite_html(r.content, url)
+            # Use r.url (post-redirect) so relative URLs resolve correctly
+            content = rewrite_html(r.content, r.url)
             headers['content-type'] = 'text/html; charset=utf-8'
-        elif 'javascript' in content_type:
-            content = r.content
-            headers['content-type'] = content_type
         else:
             content = r.content
 
@@ -144,36 +158,42 @@ def proxy():
 
 @app.route('/proxy/', methods=['POST'])
 def proxy_post():
-    """Handles login form POSTs — passes form data through and stores the session cookie."""
     url = request.args.get('url')
     if not url:
         return 'Missing url', 400
     try:
         sess = session_for(url)
+        ct = request.content_type or ''
 
-        content_type = request.content_type or ''
-        if 'application/json' in content_type:
-            r = sess.post(url, json=request.get_json(silent=True), timeout=10, allow_redirects=True, headers={
+        if 'application/json' in ct:
+            r = sess.post(url, json=request.get_json(silent=True, force=True),
+                          timeout=15, allow_redirects=True, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Content-Type': content_type,
+                'Content-Type': ct,
+                'Accept': request.headers.get('Accept', '*/*'),
+            })
+        elif 'application/x-www-form-urlencoded' in ct or 'multipart/form-data' in ct:
+            r = sess.post(url, data=request.form, files=request.files or None,
+                          timeout=15, allow_redirects=True, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': request.headers.get('Accept', '*/*'),
             })
         else:
-            r = sess.post(url, data=request.form, timeout=10, allow_redirects=True, headers={
+            r = sess.post(url, data=request.get_data(),
+                          timeout=15, allow_redirects=True, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Content-Type': content_type,
+                'Content-Type': ct,
+                'Accept': request.headers.get('Accept', '*/*'),
             })
 
         excluded = {'x-frame-options', 'content-security-policy', 'transfer-encoding',
-                    'content-encoding', 'content-length'}
+                    'content-encoding', 'content-length', 'strict-transport-security'}
         headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded}
 
         content_type_resp = r.headers.get('content-type', '')
         if 'text/html' in content_type_resp:
-            content = rewrite_html(r.content, url)
+            content = rewrite_html(r.content, r.url)
             headers['content-type'] = 'text/html; charset=utf-8'
-        elif 'javascript' in content_type_resp:
-            content = r.content
-            headers['content-type'] = content_type_resp
         else:
             content = r.content
 
@@ -184,7 +204,6 @@ def proxy_post():
 
 @app.route('/login-helper')
 def login_helper():
-    """A simple page listing all configured URLs so you can click through and log in."""
     pages = os.environ.get('PAGES', '')
     page_list = [p.strip() for p in pages.split(',') if p.strip()]
     links = ''.join(
@@ -204,7 +223,8 @@ def login_helper():
 </style>
 </head><body>
 <h2>Login helper</h2>
-<p>Click each link and log in through the proxy. Sessions are stored server-side and will be reused by the carousel.</p>
+<p>Click each link, log in through the proxy window that opens, then close it and return here.<br>
+Sessions are stored server-side and will be reused automatically by the carousel.</p>
 <ul>{links}</ul>
 </body></html>'''
     return Response(html, mimetype='text/html')
