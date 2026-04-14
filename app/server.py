@@ -35,28 +35,64 @@ def rewrite_html(content, base_url):
 
     text = re.sub(r'url\(([^)]+)\)', replace_css_url, text)
 
-    base_script = f'''<script>
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    base_script = f'''<base href="{origin}/">
+    <script>
     (function() {{
         var BASE = "{base_url}";
+        var ORIGIN = "{origin}";
+
+        // Proxy fetch
         var origFetch = window.fetch;
         window.fetch = function(url, opts) {{
-            if (typeof url === "string" && !url.startsWith("http") && !url.startsWith("/proxy")) {{
-                url = "/proxy/?url=" + encodeURIComponent(new URL(url, BASE).href);
+            if (typeof url === "string" && !url.startsWith("/proxy")) {{
+                var abs = url.startsWith("http") ? url : new URL(url, BASE).href;
+                url = "/proxy/?url=" + encodeURIComponent(abs);
             }}
             return origFetch(url, opts);
         }};
+
+        // Proxy XHR
         var origXHR = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url) {{
-            if (typeof url === "string" && !url.startsWith("http") && !url.startsWith("/proxy")) {{
-                url = "/proxy/?url=" + encodeURIComponent(new URL(url, BASE).href);
+            if (typeof url === "string" && !url.startsWith("/proxy")) {{
+                var abs = url.startsWith("http") ? url : new URL(url, BASE).href;
+                url = "/proxy/?url=" + encodeURIComponent(abs);
             }}
             return origXHR.apply(this, arguments);
         }};
+
+        // Intercept window.location redirects
+        var _assign = window.location.assign.bind(window.location);
+        Object.defineProperty(window, 'location', {{
+            get: function() {{ return window._location_real || location; }},
+            set: function(url) {{
+                var abs = (typeof url === "string" && !url.startsWith("http"))
+                    ? new URL(url, BASE).href : url;
+                _assign("/proxy/?url=" + encodeURIComponent(abs));
+            }}
+        }});
+
+        // Intercept history.pushState / replaceState (SPA routing)
+        var origPush    = history.pushState.bind(history);
+        var origReplace = history.replaceState.bind(history);
+        function proxyState(fn, state, title, url) {{
+            if (url && !url.startsWith("/proxy")) {{
+                var abs = url.startsWith("http") ? url : new URL(url, BASE).href;
+                url = "/proxy/?url=" + encodeURIComponent(abs);
+            }}
+            return fn(state, title, url);
+        }}
+        history.pushState    = function(s,t,u) {{ proxyState(origPush,    s, t, u); }};
+        history.replaceState = function(s,t,u) {{ proxyState(origReplace, s, t, u); }};
     }})();
     </script>'''
 
-    text = text.replace('<head>', '<head>' + base_script, 1)
-    if '<head>' not in text:
+    if '<head>' in text:
+        text = text.replace('<head>', '<head>' + base_script, 1)
+    else:
         text = base_script + text
 
     return text.encode('utf-8')
@@ -66,6 +102,7 @@ def rewrite_html(content, base_url):
 def index():
     return send_file('/app/index.html')
 
+
 @app.route('/config.js')
 def config():
     pages = os.environ.get('PAGES', 'https://example.com')
@@ -74,6 +111,7 @@ def config():
     pages_json = '[' + ','.join(f'"{p}"' for p in page_list) + ']'
     js = f'window.CAROUSEL_CONFIG = {{ pages: {pages_json}, interval: {interval} }};'
     return Response(js, mimetype='application/javascript', headers={'Cache-Control': 'no-cache'})
+
 
 @app.route('/proxy/')
 def proxy():
@@ -93,12 +131,16 @@ def proxy():
         if 'text/html' in content_type:
             content = rewrite_html(r.content, url)
             headers['content-type'] = 'text/html; charset=utf-8'
+        elif 'javascript' in content_type:
+            content = r.content
+            headers['content-type'] = content_type
         else:
             content = r.content
 
         return Response(content, status=r.status_code, headers=headers)
     except Exception as e:
         return f'Proxy error: {e}', 500
+
 
 @app.route('/proxy/', methods=['POST'])
 def proxy_post():
@@ -108,24 +150,37 @@ def proxy_post():
         return 'Missing url', 400
     try:
         sess = session_for(url)
-        r = sess.post(url, data=request.form, timeout=10, allow_redirects=True, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Content-Type': request.content_type or 'application/x-www-form-urlencoded',
-        })
+
+        content_type = request.content_type or ''
+        if 'application/json' in content_type:
+            r = sess.post(url, json=request.get_json(silent=True), timeout=10, allow_redirects=True, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Content-Type': content_type,
+            })
+        else:
+            r = sess.post(url, data=request.form, timeout=10, allow_redirects=True, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Content-Type': content_type,
+            })
+
         excluded = {'x-frame-options', 'content-security-policy', 'transfer-encoding',
                     'content-encoding', 'content-length'}
         headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded}
 
-        content_type = r.headers.get('content-type', '')
-        if 'text/html' in content_type:
+        content_type_resp = r.headers.get('content-type', '')
+        if 'text/html' in content_type_resp:
             content = rewrite_html(r.content, url)
             headers['content-type'] = 'text/html; charset=utf-8'
+        elif 'javascript' in content_type_resp:
+            content = r.content
+            headers['content-type'] = content_type_resp
         else:
             content = r.content
 
         return Response(content, status=r.status_code, headers=headers)
     except Exception as e:
         return f'Proxy error: {e}', 500
+
 
 @app.route('/login-helper')
 def login_helper():
@@ -138,13 +193,22 @@ def login_helper():
     )
     html = f'''<!DOCTYPE html>
 <html><head><title>Login helper</title>
-<style>body{{font-family:monospace;padding:2em}}li{{margin:.5em 0}}a{{color:#0ff}}</style>
+<style>
+  body {{ font-family: monospace; padding: 2em; background: #111; color: #eee; }}
+  h2 {{ color: #0ff; }}
+  p {{ color: #aaa; margin-bottom: 1.5em; }}
+  ul {{ list-style: none; padding: 0; }}
+  li {{ margin: 0.6em 0; }}
+  a {{ color: #0ff; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+</style>
 </head><body>
 <h2>Login helper</h2>
-<p>Click each link, log in, then return here. Sessions are stored in the proxy.</p>
+<p>Click each link and log in through the proxy. Sessions are stored server-side and will be reused by the carousel.</p>
 <ul>{links}</ul>
 </body></html>'''
     return Response(html, mimetype='text/html')
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
