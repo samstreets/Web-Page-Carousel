@@ -158,6 +158,7 @@ def rewrite_html(content, base_url):
     base_path  = (path_parts[0] + '/') if len(path_parts) > 1 else '/'
 
     def rewrite_url(url, base):
+        url = url.strip()   # strip newlines/whitespace that sneak into attribute values
         if not url or url.startswith(('data:', 'javascript:', '#')):
             return url
         return '/proxy/?url=' + quote(urljoin(base, url), safe='')
