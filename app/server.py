@@ -14,6 +14,32 @@ def session_for(url):
     host = urlparse(url).netloc
     return _sessions[host]
 
+def rewrite_cookies(raw_headers):
+    """
+    Rewrite Set-Cookie headers so the browser accepts them under localhost:
+    - Strip Domain= (so cookie applies to localhost)
+    - Strip Secure flag (we're on http locally)
+    - Strip SameSite=Strict/Lax (would block cross-site cookie sending)
+    - Rewrite Path if needed
+    """
+    rewritten = []
+    for raw in raw_headers.getlist('Set-Cookie'):
+        parts = [p.strip() for p in raw.split(';')]
+        filtered = []
+        for p in parts:
+            key = p.split('=')[0].strip().lower()
+            if key == 'secure':
+                continue
+            if key == 'domain':
+                continue
+            if key == 'samesite':
+                # Replace with None would need Secure, so just drop it
+                continue
+            filtered.append(p)
+        rewritten.append('; '.join(filtered))
+    return rewritten
+
+
 def rewrite_html(content, base_url):
     text = content.decode('utf-8', errors='replace')
 
@@ -63,16 +89,37 @@ def rewrite_html(content, base_url):
     // Proxy fetch
     var origFetch = window.fetch;
     window.fetch = function(url, opts) {{
-        if (typeof url === 'string') url = toProxy(url);
+        if (typeof url === 'string' && !url.startsWith('/proxy/')) url = toProxy(url);
+        if (url instanceof Request && !url.url.startsWith('/proxy/')) {{
+            url = new Request(toProxy(url.url), url);
+        }}
         return origFetch(url, opts);
     }};
 
     // Proxy XHR
     var origXHR = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {{
-        if (typeof url === 'string') url = toProxy(url);
+        if (typeof url === 'string' && !url.startsWith('/proxy/')) url = toProxy(url);
         return origXHR.apply(this, arguments);
     }};
+
+    // Proxy WebSocket — reroute wss:// through a ws-proxy endpoint
+    var OrigWS = window.WebSocket;
+    window.WebSocket = function(url, protocols) {{
+        var wsProxy = '/wsproxy/?url=' + encodeURIComponent(url);
+        // Convert http proxy base to ws
+        var loc = window.location;
+        var wsBase = (loc.protocol === 'https:' ? 'wss://' : 'ws://') + loc.host;
+        var fullWsUrl = wsBase + wsProxy;
+        if (protocols) {{
+            return new OrigWS(fullWsUrl, protocols);
+        }}
+        return new OrigWS(fullWsUrl);
+    }};
+    window.WebSocket.CONNECTING = 0;
+    window.WebSocket.OPEN = 1;
+    window.WebSocket.CLOSING = 2;
+    window.WebSocket.CLOSED = 3;
 
     // Intercept navigation
     var origAssign  = window.location.assign.bind(window.location);
@@ -98,6 +145,20 @@ def rewrite_html(content, base_url):
             window.location.assign(toProxy(href));
         }}
     }}, true);
+
+    // Patch document.cookie getter/setter to work cross-origin
+    // This prevents JS cookie reads from failing silently
+    try {{
+        var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
+                         Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
+        if (cookieDesc && cookieDesc.configurable) {{
+            Object.defineProperty(document, 'cookie', {{
+                get: function() {{ return cookieDesc.get.call(document); }},
+                set: function(val) {{ cookieDesc.set.call(document, val); }},
+                configurable: true
+            }});
+        }}
+    }} catch(e) {{}}
 }})();
 </script>'''
 
@@ -109,6 +170,29 @@ def rewrite_html(content, base_url):
         text = base_script + text
 
     return text.encode('utf-8')
+
+
+def build_response(r):
+    """Build a Flask Response from a requests.Response, with cookie rewriting."""
+    excluded = {'x-frame-options', 'content-security-policy', 'transfer-encoding',
+                'content-encoding', 'content-length', 'strict-transport-security',
+                'set-cookie'}  # handle cookies manually below
+    headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded}
+
+    content_type = r.headers.get('content-type', '')
+    if 'text/html' in content_type:
+        content = rewrite_html(r.content, r.url)
+        headers['content-type'] = 'text/html; charset=utf-8'
+    else:
+        content = r.content
+
+    resp = Response(content, status=r.status_code, headers=headers)
+
+    # Rewrite and re-attach cookies
+    for cookie_str in rewrite_cookies(r.raw.headers):
+        resp.headers.add('Set-Cookie', cookie_str)
+
+    return resp
 
 
 @app.route('/')
@@ -126,6 +210,13 @@ def config():
     return Response(js, mimetype='application/javascript', headers={'Cache-Control': 'no-cache'})
 
 
+PROXY_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+
 @app.route('/proxy/', methods=['GET'])
 def proxy():
     url = request.args.get('url')
@@ -133,25 +224,11 @@ def proxy():
         return 'Missing url', 400
     try:
         sess = session_for(url)
-        r = sess.get(url, timeout=15, allow_redirects=True, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': request.headers.get('Accept', '*/*'),
-            'Accept-Language': request.headers.get('Accept-Language', 'en-US,en;q=0.9'),
-        })
-
-        excluded = {'x-frame-options', 'content-security-policy', 'transfer-encoding',
-                    'content-encoding', 'content-length', 'strict-transport-security'}
-        headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded}
-
-        content_type = r.headers.get('content-type', '')
-        if 'text/html' in content_type:
-            # Use r.url (post-redirect) so relative URLs resolve correctly
-            content = rewrite_html(r.content, r.url)
-            headers['content-type'] = 'text/html; charset=utf-8'
-        else:
-            content = r.content
-
-        return Response(content, status=r.status_code, headers=headers)
+        hdrs = {**PROXY_HEADERS,
+                'Accept': request.headers.get('Accept', 'text/html,*/*'),
+                'Referer': url}  # some sites check Referer for CSRF
+        r = sess.get(url, timeout=15, allow_redirects=True, headers=hdrs)
+        return build_response(r)
     except Exception as e:
         return f'Proxy error: {e}', 500
 
@@ -164,42 +241,94 @@ def proxy_post():
     try:
         sess = session_for(url)
         ct = request.content_type or ''
+        hdrs = {**PROXY_HEADERS,
+                'Accept': request.headers.get('Accept', '*/*'),
+                'Referer': url}
 
         if 'application/json' in ct:
             r = sess.post(url, json=request.get_json(silent=True, force=True),
-                          timeout=15, allow_redirects=True, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Content-Type': ct,
-                'Accept': request.headers.get('Accept', '*/*'),
-            })
+                          timeout=15, allow_redirects=True,
+                          headers={**hdrs, 'Content-Type': ct})
         elif 'application/x-www-form-urlencoded' in ct or 'multipart/form-data' in ct:
             r = sess.post(url, data=request.form, files=request.files or None,
-                          timeout=15, allow_redirects=True, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': request.headers.get('Accept', '*/*'),
-            })
+                          timeout=15, allow_redirects=True, headers=hdrs)
         else:
             r = sess.post(url, data=request.get_data(),
-                          timeout=15, allow_redirects=True, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Content-Type': ct,
-                'Accept': request.headers.get('Accept', '*/*'),
-            })
+                          timeout=15, allow_redirects=True,
+                          headers={**hdrs, 'Content-Type': ct})
 
-        excluded = {'x-frame-options', 'content-security-policy', 'transfer-encoding',
-                    'content-encoding', 'content-length', 'strict-transport-security'}
-        headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded}
-
-        content_type_resp = r.headers.get('content-type', '')
-        if 'text/html' in content_type_resp:
-            content = rewrite_html(r.content, r.url)
-            headers['content-type'] = 'text/html; charset=utf-8'
-        else:
-            content = r.content
-
-        return Response(content, status=r.status_code, headers=headers)
+        return build_response(r)
     except Exception as e:
         return f'Proxy error: {e}', 500
+
+
+# ---------------------------------------------------------------------------
+# WebSocket proxy — bridges browser WS to the upstream wss:// server
+# Requires: pip install flask-sockets gevent gevent-websocket
+# The Dockerfile pip install line must include these packages.
+# ---------------------------------------------------------------------------
+try:
+    from geventwebsocket import WebSocketError
+    from geventwebsocket.handler import WebSocketHandler
+    import websocket as ws_client  # websocket-client
+
+    @app.route('/wsproxy/')
+    def wsproxy():
+        target_url = request.args.get('url')
+        if not target_url:
+            return 'Missing url', 400
+
+        client_ws = request.environ.get('wsgi.websocket')
+        if not client_ws:
+            return 'WebSocket upgrade required', 426
+
+        try:
+            upstream = ws_client.create_connection(
+                target_url,
+                header=[f'User-Agent: {PROXY_HEADERS["User-Agent"]}'],
+                suppress_origin=True,
+            )
+        except Exception as e:
+            return f'WS upstream connect error: {e}', 502
+
+        import gevent
+
+        def client_to_upstream():
+            try:
+                while True:
+                    msg = client_ws.receive()
+                    if msg is None:
+                        break
+                    upstream.send(msg)
+            except WebSocketError:
+                pass
+            finally:
+                upstream.close()
+
+        def upstream_to_client():
+            try:
+                while True:
+                    msg = upstream.recv()
+                    if msg is None:
+                        break
+                    client_ws.send(msg)
+            except (WebSocketError, Exception):
+                pass
+            finally:
+                client_ws.close()
+
+        c2u = gevent.spawn(client_to_upstream)
+        u2c = gevent.spawn(upstream_to_client)
+        gevent.joinall([c2u, u2c])
+        return ''
+
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+
+    @app.route('/wsproxy/')
+    def wsproxy():
+        return 'WebSocket proxy not available — install flask-sockets gevent gevent-websocket websocket-client', 501
 
 
 @app.route('/login-helper')
@@ -231,4 +360,12 @@ Sessions are stored server-side and will be reused automatically by the carousel
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+    if WS_AVAILABLE:
+        from gevent import pywsgi
+        from geventwebsocket.handler import WebSocketHandler
+        server = pywsgi.WSGIServer(('0.0.0.0', 80), app, handler_class=WebSocketHandler)
+        print("Starting with WebSocket support")
+        server.serve_forever()
+    else:
+        print("Starting without WebSocket support (install gevent packages to enable)")
+        app.run(host='0.0.0.0', port=80)
