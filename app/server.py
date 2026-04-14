@@ -153,6 +153,10 @@ def rewrite_html(content, base_url):
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
+    # Derive the base path for webpack public path patching
+    path_parts = parsed.path.rsplit('/', 1)
+    base_path  = (path_parts[0] + '/') if len(path_parts) > 1 else '/'
+
     def rewrite_url(url, base):
         if not url or url.startswith(('data:', 'javascript:', '#')):
             return url
@@ -172,11 +176,26 @@ def rewrite_html(content, base_url):
 
     log.debug(f"  {DIM}⚙ HTML rewrite: {n_attr} attrs, {n_css} CSS urls{RESET}")
 
+    # Build a list of URL path segments to block (logout/auth-check endpoints).
+    # Any fetch/XHR whose URL contains one of these fragments will be silently
+    # swallowed so the embedded app cannot log itself out or redirect away.
+    blocked_patterns = [
+        '/api/v1.0/logout',
+        '/api/v1.0/auth/logout',
+        '/logout',
+        '/signout',
+        '/sign-out',
+        '/log-out',
+    ]
+    blocked_json = str(blocked_patterns).replace("'", '"')
+
     inject = f'''<script>
 (function() {{
     var BASE = "{base_url}";
     var ORIGIN = "{origin}";
+    var BASE_PATH = "{base_path}";
 
+    /* ---- URL helper ---- */
     function toProxy(url) {{
         if (!url || url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('/proxy/?url=')) return url;
         var abs;
@@ -187,21 +206,43 @@ def rewrite_html(content, base_url):
         return '/proxy/?url=' + encodeURIComponent(abs);
     }}
 
-    /* fetch */
+    /* ---- Logout / auth-check blocker ---- */
+    var BLOCKED = {blocked_json};
+    function isBlocked(url) {{
+        if (!url) return false;
+        var u = String(url);
+        return BLOCKED.some(function(p) {{ return u.indexOf(p) !== -1; }});
+    }}
+
+    /* ---- fetch ---- */
     var _fetch = window.fetch;
     window.fetch = function(url, opts) {{
+        var urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+        if (isBlocked(urlStr)) {{
+            console.warn('[proxy] blocked fetch:', urlStr);
+            return Promise.resolve(new Response(JSON.stringify({{errcode: 0, errmsg: 'ok'}}), {{
+                status: 200,
+                headers: {{'Content-Type': 'application/json'}}
+            }}));
+        }}
         if (typeof url === 'string' && !url.startsWith('/proxy/')) url = toProxy(url);
         return _fetch(url, opts);
     }};
 
-    /* XHR */
+    /* ---- XHR ---- */
     var _xhrOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {{
-        if (typeof url === 'string' && !url.startsWith('/proxy/')) url = toProxy(url);
+        if (isBlocked(url)) {{
+            console.warn('[proxy] blocked XHR:', url);
+            // Redirect to a harmless no-op endpoint
+            arguments[1] = '/noop/';
+        }} else if (typeof url === 'string' && !url.startsWith('/proxy/')) {{
+            arguments[1] = toProxy(url);
+        }}
         return _xhrOpen.apply(this, arguments);
     }};
 
-    /* WebSocket */
+    /* ---- WebSocket ---- */
     var _WS = window.WebSocket;
     window.WebSocket = function(url, protocols) {{
         console.log('[proxy] WS intercepted:', url);
@@ -213,18 +254,18 @@ def rewrite_html(content, base_url):
     window.WebSocket.CONNECTING = 0; window.WebSocket.OPEN = 1;
     window.WebSocket.CLOSING = 2;   window.WebSocket.CLOSED = 3;
 
-    /* navigation */
+    /* ---- navigation ---- */
     var _assign  = window.location.assign.bind(window.location);
     var _replace = window.location.replace.bind(window.location);
     window.location.assign  = function(u) {{ console.log('[proxy] assign:', u); _assign(toProxy(u)); }};
     window.location.replace = function(u) {{ console.log('[proxy] replace:', u); _replace(toProxy(u)); }};
 
-    /* history SPA */
+    /* ---- history SPA ---- */
     var _push = history.pushState.bind(history), _rep = history.replaceState.bind(history);
     history.pushState    = function(s,t,u) {{ _push(s,t, u ? toProxy(u) : u); }};
     history.replaceState = function(s,t,u) {{ _rep(s,t,  u ? toProxy(u) : u); }};
 
-    /* dynamic links */
+    /* ---- dynamic links ---- */
     document.addEventListener('click', function(e) {{
         var a = e.target.closest('a');
         if (!a) return;
@@ -232,6 +273,64 @@ def rewrite_html(content, base_url):
         if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
         if (!href.startsWith('/proxy/')) {{ e.preventDefault(); window.location.assign(toProxy(href)); }}
     }}, true);
+
+    /* ---- iframe self-detection bypass ---- */
+    // Some apps call `window.top !== window.self` to detect framing and bail out.
+    // We can't fully spoof this, but we make window.top appear same-origin by
+    // overriding the getter to return window itself.
+    try {{
+        Object.defineProperty(window, 'top', {{ get: function() {{ return window; }} }});
+        Object.defineProperty(window, 'parent', {{ get: function() {{ return window; }} }});
+        Object.defineProperty(window, 'frameElement', {{ get: function() {{ return null; }} }});
+    }} catch(e) {{
+        // read-only in some browsers — best effort
+    }}
+
+    /* ---- webpack public path patch ---- */
+    // Webpack loads dynamic chunks via __webpack_require__.p (the public path).
+    // We intercept as soon as the runtime sets it and redirect through the proxy.
+    var _wpTimeout = null;
+    function patchWebpack() {{
+        if (typeof __webpack_require__ !== 'undefined') {{
+            try {{
+                var current = __webpack_require__.p || '/';
+                if (current && !current.startsWith('/proxy/')) {{
+                    var abs = current.startsWith('http') ? current : (ORIGIN + current);
+                    __webpack_require__.p = '/proxy/?url=' + encodeURIComponent(abs);
+                    console.log('[proxy] webpack public path patched to', __webpack_require__.p);
+                }}
+            }} catch(e) {{}}
+        }} else {{
+            _wpTimeout = setTimeout(patchWebpack, 50);
+        }}
+    }}
+    patchWebpack();
+
+    /* ---- Also intercept script/link element injection ---- */
+    var _createElement = document.createElement.bind(document);
+    document.createElement = function(tag) {{
+        var el = _createElement(tag);
+        if (tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link') {{
+            var srcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src')
+                       || Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype,  'href');
+            ['src', 'href'].forEach(function(attr) {{
+                var orig = Object.getOwnPropertyDescriptor(el.__proto__, attr);
+                if (!orig) return;
+                Object.defineProperty(el, attr, {{
+                    set: function(v) {{
+                        if (v && !v.startsWith('/proxy/') && !v.startsWith('data:') && !v.startsWith('blob:')) {{
+                            v = toProxy(v);
+                        }}
+                        orig.set.call(this, v);
+                    }},
+                    get: function() {{ return orig.get.call(this); }},
+                    configurable: true,
+                }});
+            }});
+        }}
+        return el;
+    }};
+
 }})();
 </script>'''
 
@@ -316,6 +415,12 @@ def config():
     js = f'window.CAROUSEL_CONFIG = {{ pages: {pages_json}, interval: {interval} }};'
     log.debug(f"config.js served: {len(page_list)} pages, interval={interval}s")
     return Response(js, mimetype='application/javascript', headers={'Cache-Control': 'no-cache'})
+
+
+@app.route('/noop/', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
+def noop():
+    """Silent no-op endpoint for blocked XHR/fetch calls (e.g. logout)."""
+    return Response('{"errcode":0,"errmsg":"ok"}', mimetype='application/json')
 
 
 @app.route('/proxy/', methods=['GET'])
